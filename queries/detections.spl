@@ -1,0 +1,223 @@
+# ============================================
+# QUERY 1: EventCode Baseline
+# What it does: Shows all event types and their volume
+# Why it matters: First step in any investigation - understand 
+# what data exists before writing detections
+# ============================================
+sourcetype=WinEventLog:Security
+| stats count by EventCode
+| sort - count
+
+
+# ============================================
+# QUERY 2: Noise Investigation - EventCode 4907
+# What it does: Identifies which process is generating 
+# audit setting change events
+# Why it matters: 70% of log volume came from this one code.
+# Traced it to Windows Update processes - a tuning candidate
+# MITRE ATT&CK: Not malicious in this case, but 4907 can indicate
+# T1562.002 - Disable Windows Event Logging if from unexpected process
+# ============================================
+sourcetype=WinEventLog:Security EventCode=4907
+| stats count by Process_Name
+| sort - count
+
+
+# ============================================
+# QUERY 3: Successful Logon Baseline - EventCode 4624
+# What it does: Shows who is authenticating to this machine
+# Why it matters: Establishes normal logon behavior. Anomalies
+# indicate lateral movement or unauthorized access
+# MITRE ATT&CK: T1078 - Valid Accounts
+# ============================================
+sourcetype=WinEventLog:Security EventCode=4624
+| stats count by Account_Name
+| sort - count
+
+
+# ============================================
+# QUERY 4: Privilege Assignment - EventCode 4672
+# What it does: Shows which accounts receive admin-level privileges
+# Why it matters: Normal user accounts should not generate 4672.
+# Unexpected 4672 indicates privilege escalation
+# MITRE ATT&CK: T1078.003 - Local Accounts
+# ============================================
+sourcetype=WinEventLog:Security EventCode=4672
+| stats count by Account_Name
+| sort - count
+
+
+# ============================================
+# QUERY 5: Failed Logon Detection - EventCode 4625
+# What it does: Detects brute force attempts by thresholding
+# failed logins per account
+# Why it matters: 10+ failures against one account = likely 
+# password spray or brute force
+# MITRE ATT&CK: T1110 - Brute Force
+# ============================================
+sourcetype=WinEventLog:Security EventCode=4625
+| stats count by Account_Name, Source_Network_Address
+| where count > 10
+| sort - count
+
+
+# ============================================
+# QUERY 6: Sysmon EventID Baseline
+# What it does: Shows which Sysmon event types are present
+# Why it matters: Understand what Sysmon is capturing before
+# writing detections against it
+# ============================================
+sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+| rex field=_raw "<EventID>(?<EventID>\d+)</EventID>"
+| stats count by EventID
+| sort - count
+
+
+# ============================================
+# QUERY 7: Sysmon Process Creation
+# What it does: Lists every executable that launched on the host
+# Why it matters: Every attack involves process execution.
+# Unusual executables or paths indicate malicious activity
+# MITRE ATT&CK: T1059 - Command and Scripting Interpreter
+# ============================================
+sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+| rex field=_raw "<EventID>(?<EventID>\d+)</EventID>"
+| rex field=_raw "<Data Name='Image'>(?<Image>[^<]+)</Data>"
+| where EventID="1"
+| stats count by Image
+| sort - count
+
+
+# ============================================
+# QUERY 8: Sysmon Parent-Child Process Relationships
+# What it does: Shows which process launched which other process
+# Why it matters: Malicious macros show as Word.exe spawning cmd.exe
+# Compromised services show as svchost.exe spawning recon tools
+# MITRE ATT&CK: T1059 - Command and Scripting Interpreter
+#               T1566.001 - Phishing: Spearphishing Attachment
+# ============================================
+sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"
+| rex field=_raw "<EventID>(?<EventID>\d+)</EventID>"
+| rex field=_raw "<Data Name='Image'>(?<Image>[^<]+)</Data>"
+| rex field=_raw "<Data Name='ParentImage'>(?<ParentImage>[^<]+)</Data>"
+| where EventID="1"
+| stats count by ParentImage, Image
+| sort - count
+
+
+# ============================================
+# QUERY 9: BOTS Dataset Overview
+# What it does: Inventories all sourcetypes in the BOTS v1 dataset
+# Why it matters: First step on any unfamiliar dataset. Tells you what
+# telemetry is available before deciding where to investigate
+# Result: 955,807 events across 22 sourcetypes including Sysmon, Suricata
+# IDS, Fortinet firewall, Windows Security, Registry, and Splunk Stream
+# NOTE: Requires time range = All Time. BOTS data is from August 2016
+# ============================================
+index=botsv1
+| stats count by sourcetype
+| sort - count
+
+
+# ============================================
+# QUERY 10: Attacker Identification via Traffic Volume
+# What it does: Ranks HTTP source/destination pairs by request volume
+# Why it matters: Attackers using automated tooling generate volume far
+# outside human browsing patterns. Volume distribution isolates them
+# without needing to know what to look for in advance
+# Result: 40.80.148.42 sent 17,546 requests to internal 192.168.250.70.
+# Next highest external source sent 1,429, a 12x gap
+# ============================================
+index=botsv1 sourcetype=stream:http
+| stats count by src_ip, dest_ip
+| sort - count
+
+
+# ============================================
+# QUERY 11: Web Attack Analysis
+# What it does: Breaks the attacker's requests down by HTTP method and URI
+# Why it matters: Reveals what the attacker was actually attempting rather
+# than just that they were noisy. Method plus path is the technique
+# Result: 11,923 POSTs to the Joomla search component (automated injection
+# testing), only 14 POSTs to the admin login (too few for brute force),
+# and GET requests for /boot.ini and /windows/win.ini%00.jpg (path
+# traversal with null byte injection to bypass extension filtering)
+# MITRE ATT&CK: T1595.002 Active Scanning: Vulnerability Scanning
+#               T1190 Exploit Public-Facing Application
+#               T1027 Obfuscated Files or Information
+# ============================================
+index=botsv1 sourcetype=stream:http src_ip="40.80.148.42"
+| stats count by http_method, uri_path
+| sort - count
+
+
+# ============================================
+# QUERY 12: Attack Timeline Reconstruction
+# What it does: Buckets attacker traffic into 5-minute intervals by method
+# Why it matters: Converts "what happened" into "in what order." Phase
+# changes in attacker behavior are only visible over time
+# Result: 45-minute attack. 17:35 recon (2,395 GET vs 102 POST, plus
+# scanner-typical OPTIONS/PROPFIND/TRACE/CONNECT). 17:50 onward
+# exploitation (GET drops to zero, POST sustains 1,500-2,200 per interval).
+# The GET-to-POST crossover marks enumeration shifting to payload delivery
+# ============================================
+index=botsv1 sourcetype=stream:http src_ip="40.80.148.42"
+| timechart span=5m count by http_method
+
+
+# ============================================
+# QUERY 13: BOTS Windows EventCode Baseline
+# What it does: Extracts and counts Windows event codes from BOTS
+# Why it matters: BOTS was indexed on Splunk 6 with add-ons that are not
+# installed here, so EventCode is not auto-extracted. rex pulls it from
+# the raw event text instead of relying on parsed fields
+# Result: 33 event codes across 87,430 events. Notable: 5145 (24,430) and
+# 5140 (3,047) share access, 4688/4689 (8,009) process lifecycle,
+# 4776 (2,384) credential validation
+# ============================================
+index=botsv1 sourcetype=wineventlog:security
+| rex field=_raw "EventCode=(?<EventCode>\d+)"
+| stats count by EventCode
+| sort - count
+
+
+# ============================================
+# QUERY 14: Windows Credential Attack Detection
+# What it does: Isolates EventCode 4776 (NTLM credential validation) and
+# groups by target account and source workstation
+# Why it matters: Brute force against Windows shows as heavy concentration
+# on a single privileged account. 4776 fires on the domain controller, so
+# it captures attempts that never reach a successful logon event
+# Result: 2,382 of 2,384 events targeted "Administrator" on
+# waynecorpinc.local. Remaining two were single events from WE8105DESK
+# MITRE ATT&CK: T1110.001 Brute Force: Password Guessing
+# NEXT STEP: break down by Error Code to separate failures from successes
+# (0x0 = success, 0xC000006A = bad password, 0xC0000064 = no such account)
+# ============================================
+index=botsv1 sourcetype=wineventlog:security
+| rex field=_raw "EventCode=(?<EventCode>\d+)"
+| rex field=_raw "Logon Account:\s+(?<acct>\S+)"
+| rex field=_raw "Source Workstation:\s+(?<workstation>\S+)"
+| where EventCode="4776"
+| stats count by acct, workstation
+| sort - count
+
+
+# ============================================
+# QUERY 15: BOTS Sysmon Event Distribution
+# What it does: Extracts Sysmon EventIDs from raw XML and counts each type
+# Why it matters: Sysmon volume profile tells you what the host telemetry
+# can support. Also surfaces anti-forensics activity
+# Result: 270,597 events across 6 types. EventID 7 image loads (168,374)
+# and EventID 3 network connections (99,320) dominate. EventID 2 file
+# creation time changed (1,434) indicates timestomping, an anti-forensics
+# technique used to backdate files so they blend with system files and
+# evade timeline analysis
+# MITRE ATT&CK: T1070.006 Indicator Removal: Timestomp
+#               T1574.002 DLL Side-Loading (EventID 7 relevance)
+#               T1071 Application Layer Protocol (EventID 3 relevance)
+# ============================================
+index=botsv1 sourcetype="xmlwineventlog:microsoft-windows-sysmon/operational"
+| rex field=_raw "<EventID>(?<EventID>\d+)</EventID>"
+| stats count by EventID
+| sort - count
