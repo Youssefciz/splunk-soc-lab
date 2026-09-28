@@ -1,10 +1,11 @@
 # Splunk SOC Detection Lab
 
 ## Overview
-A hands-on SIEM detection lab built with Splunk Enterprise, covering two phases:
-onboarding and analyzing live Windows telemetry from a local host, then
-investigating a multi-stage attack in the Boss of the SOC (BOTS v1) dataset.
-Detections are mapped to MITRE ATT&CK.
+A hands-on SIEM detection lab built with Splunk Enterprise, covering three phases:
+onboarding and analyzing live Windows telemetry from a local host, investigating a
+multi-stage attack in the Boss of the SOC (BOTS v1) dataset, then building an
+AI-assisted triage pipeline that runs detections through Splunk's REST API and uses
+an LLM for first-pass analysis. Detections are mapped to MITRE ATT&CK.
 
 ## Environment
 
@@ -19,6 +20,11 @@ Detections are mapped to MITRE ATT&CK.
 - 955,807 events across 22 sourcetypes
 - Sysmon, Suricata IDS, Fortinet firewall, Windows Security, Windows Registry,
   Splunk Stream (HTTP, DNS, SMB, TCP, IP, ICMP, MAPI, LDAP), IIS
+
+**Phase 3: AI-assisted triage**
+- Boss of the SOC Version 1, full dataset (33,413,777 events)
+- Python, Splunk REST API (splunk-sdk)
+- Google Gemini API (free tier)
 
 ---
 
@@ -254,6 +260,141 @@ why Event ID 7 is commonly filtered in production deployments.
 
 ---
 
+# Phase 3: AI-Assisted Triage
+
+Code, setup, and sample reports: [`splunk-ai-triage/`](splunk-ai-triage/)
+
+Phases 1 and 2 were manual investigation. Phase 3 tests whether an LLM can handle
+the first pass of alert triage: read detection results, rate severity, map to
+MITRE ATT&CK, and recommend next steps, while an analyst stays in control of every
+decision. The model only recommends; it never takes action.
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    A[Splunk REST API<br/>5 detections] --> B[Pseudonymize<br/>IPs, hosts, users]
+    B --> C[LLM triage<br/>per detection]
+    C --> D[Correlation pass<br/>one attack chain]
+    D --> E[Restore real values<br/>locally]
+    E --> F[Markdown report<br/>for analyst review]
+```
+
+A Python script runs each detection through the Splunk REST API, masks sensitive
+values, and sends the results to the model with a fixed JSON schema (severity,
+confidence, narrative, MITRE mapping, actions, false positive notes, and a
+follow-up SPL query). A final request connects all findings into a single attack
+chain. Real values are restored locally and the report is sorted by severity.
+
+**Dataset note:** Phase 3 ran after rebuilding the Splunk instance with the full
+BOTS v1 dataset (33,413,777 events) rather than the attack-only subset used in
+Phase 2, so event counts differ between phases.
+
+## 11. Detections
+
+| Detection | Sourcetype | Logic |
+|---|---|---|
+| Web Vulnerability Scanning | stream:http | Over 100 requests per source, with distinct URI count |
+| Web Login Brute Force | stream:http | Over 20 POSTs containing password fields to one URI |
+| IDS Alerts | suricata | Top signatures by source and destination |
+| Firewall Top Talkers | fgt_utm | Highest volume source and destination pairs |
+| Suspicious Process Execution | Sysmon | cmd.exe and powershell.exe launches (Event ID 1) |
+
+The Fortinet sourcetype in this dataset is `fgt_utm`, with `srcip` and `dstip`
+rather than `src_ip` and `dest_ip`. Sysmon events again required `rex`
+extraction because they are stored as raw XML.
+
+## 12. Pseudonymization Design
+
+Before any data leaves the environment, IP addresses, hostnames, and usernames are
+replaced with consistent tokens (`EXT_IP_1`, `INT_IP_2`, `HOST_1`). A single
+mapping per run means the same entity carries the same token across every
+detection, which is what allows the model to correlate them. Real values are
+restored locally after the model responds, including inside its suggested
+follow-up searches.
+
+**Takeaway:** the first version used generic `IP_n` tokens, which hid whether an
+address was internal or external. The model then recommended blocking an internal
+host at the perimeter. Tokens now keep the network zone (`INT_IP` vs `EXT_IP`)
+while still hiding the address. A privacy control has to preserve the context the
+analysis depends on.
+
+## 13. v1 Results
+
+Full report: [`report_v1.md`](splunk-ai-triage/report_v1.md). The firewall
+detection failed in this run due to API overload, so 4 of 5 detections were
+triaged.
+
+**What the model got right:**
+- The Acunetix scan and exploit attempts (XSS, SQL injection, XXE, Shellshock
+  CVE-2014-6271) from 40.80.148.42 against 192.168.250.70
+- 412 password-bearing POSTs from 23.22.63.114 to
+  `/joomla/administrator/index.php`
+- Two Sysmon findings not covered in Phase 2: WINWORD.EXE spawning cmd.exe to
+  build an obfuscated VBScript on we8105desk (malicious macro), and PHP spawning
+  cmd.exe for reconnaissance on we1149srv (web shell)
+
+**What the model got wrong:**
+- Invented index names in follow-up searches (`index=web_logs`, `index=*`)
+- Rated every finding High, including evidence of successful compromise
+- Labeled 23.22.63.114 a scanner even though it requested a single unique URI
+- Recommended perimeter blocking of internal host 192.168.2.50
+- Analyzed each detection in isolation, producing no attack chain
+
+## 14. v2 Improvements
+
+Full report: [`report_v2.md`](splunk-ai-triage/report_v2.md)
+
+| Problem | Fix | Result |
+|---|---|---|
+| Invented index names | Prompt lists the index, sourcetypes, and fields | All follow-ups use `index=botsv1`. One still contained a typo (`sourcetypes=`) and one used fields not provided |
+| Uncalibrated severity | Rubric where Critical requires evidence of success | Sysmon Critical, brute force High, scanning Medium |
+| Unsupported MITRE mappings | Evidence rules in the prompt | Partial. T1078 Valid Accounts still assigned to the brute force with no successful login shown, and an invalid technique ID (T1240) appeared |
+| Internal host treated as attacker | `INT_IP` / `EXT_IP` tokens | Fixed. 192.168.2.50 flagged for inspection, not blocking |
+| No correlation | Final pass across all masked findings | Linked the scan, exploits, brute force, and web shell into one chain, and left the unconfirmed link between 192.168.250.70 and we1149srv as an open question. Overreached by merging the unrelated we8105desk macro into the same attack |
+
+**Takeaway:** prompt changes reduced errors but did not eliminate them. The model
+still broke rules it was explicitly given. Anything that can be checked
+deterministically, such as whether a technique ID exists or a search runs,
+belongs in code rather than in the prompt.
+
+## 15. AI vs Manual Analysis
+
+The two approaches caught different things.
+- The pipeline found the 412-attempt brute force from 23.22.63.114 against the
+  Joomla admin login. Phase 2 (section 7) correctly ruled out brute force from
+  40.80.148.42 but did not examine this second source.
+- Manual analysis found what the pipeline could not: the 45-minute
+  recon-to-exploitation timeline (section 8), password guessing against
+  Administrator via EventCode 4776 (section 9), and timestomping via Sysmon
+  Event ID 2 (section 10). The pipeline's detections aggregate with `stats` and
+  carry no timestamps, and none of them targeted those event types.
+
+**Takeaway:** the model is a fast first pass, not a replacement for an analyst.
+Its coverage is bounded by the detections it is given.
+
+## 16. Reliability
+
+- **Model availability:** the free tier returned repeated 503 overload errors,
+  and one model was retired for new API users mid-build. Model names are
+  configuration rather than code, calls retry with exponential backoff (10s,
+  20s, 40s) on 429, 500, and 503 errors, and a second model acts as fallback.
+- **Partial failure:** one failed detection does not stop the run; the report is
+  written with whatever succeeded.
+- **Secrets:** credentials are read from environment variables and never stored
+  in code.
+- **Rate limits:** requests are paced to stay under free tier limits.
+
+## Development Note
+
+Developed collaboratively with Claude (Anthropic). I came up with the concept, set
+the requirements, built and configured the Splunk lab, debugged and tested the
+script against the BOTS v1 dataset, reviewed the AI output, and directed the v2
+improvements. Claude assisted with writing and reviewing the code. Google Gemini is
+the model the script calls at runtime.
+
+---
+
 ## Detection Alerting
 
 Built a scheduled alert (`Failed Credential Validation Spike`) on the 4776
@@ -306,6 +447,7 @@ assignment by account, and Sysmon process creation activity.
 - `where` for post-aggregation filtering
 - Pipeline chaining to transform results through successive stages
 - Scheduled alerting with trigger conditions
+- Running searches programmatically through the Splunk REST API
 
 ## Screenshots
 
@@ -329,9 +471,19 @@ assignment by account, and Sysmon process creation activity.
 
 ## Next Steps
 
+**Investigation**
 - [ ] Break down 4776 error codes to separate failed from successful validations
 - [ ] Investigate the phishing scenario via stream:smtp and stream:mapi
 - [ ] Investigate data exfiltration indicators in stream:http POST bodies
 - [ ] Correlate Sysmon Event ID 3 network connections against Suricata IDS alerts
 - [ ] Cross-reference EventCode 5145 share access against stream:smb traffic
 - [ ] Build a dedicated BOTS investigation dashboard
+
+**AI-assisted triage**
+- [ ] Validate MITRE technique IDs against the official ATT&CK dataset in code
+- [ ] Run each AI-suggested follow-up search against Splunk and flag errors or empty results
+- [ ] Flag findings that share no entities with others as possible separate incidents
+- [ ] Add `earliest(_time)` and `latest(_time)` to detections so correlation can use real timestamps
+- [ ] Verify the v2 firewall finding against complete search results
+- [ ] Extend masking to IPv6 and to usernames or hostnames embedded in free text
+- [ ] Trigger triage from Splunk alerts and write results back via HEC for a dashboard
